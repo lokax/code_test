@@ -1,11 +1,7 @@
-#include <algorithm>
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
-#include <cstdlib>
-#include <deque>
 #include <iostream>
-#include <list>
 #include <memory>
 #include <mutex>
 #include <random>
@@ -16,6 +12,9 @@
 #include <vector>
 
 #define N 100000
+#define M 2
+
+#define INVALID_WORKER_ID 0
 
 enum class LockType { RLOCK = 0,
     WLOCK };
@@ -23,6 +22,7 @@ enum class LockType { RLOCK = 0,
 enum class LockStatus { LOCKED = 0,
     UNLOCKED };
 
+// 长度为N的数组，初始值为1
 std::vector<size_t> S(N, 1);
 
 /*
@@ -45,12 +45,13 @@ struct RequestQueue {
     std::condition_variable cond;
     std::unordered_set<size_t> rlock_items;
     std::unordered_set<size_t> waiting_items;
-    size_t wlock_item = 0; // 0为无效值
+    size_t wlock_item = INVALID_WORKER_ID;
 
     bool TryLock(size_t worker_id, LockType type)
     {
 
         if (type == LockType::RLOCK) {
+
             return wlock_item == 0;
         } else {
             if (wlock_item != 0) {
@@ -61,7 +62,7 @@ struct RequestQueue {
                 return true;
             }
 
-            // 可以进行锁提升
+            // 可以从读锁提升为写锁
             if (rlock_items.size() == 1 && rlock_items.count(worker_id) != 0) {
                 return true;
             }
@@ -71,23 +72,66 @@ struct RequestQueue {
     }
 };
 
+class ShardRequestTable {
+public:
+    static constexpr size_t BUCKET_NUM = 16;
+
+    ShardRequestTable()
+    {
+        mtxs.reserve(BUCKET_NUM);
+        for (size_t i = 0; i < BUCKET_NUM; ++i) {
+            auto mtx = std::make_unique<std::mutex>();
+            mtxs.emplace_back(std::move(mtx));
+        }
+        request_tables_.resize(BUCKET_NUM);
+    }
+
+    ShardRequestTable(const ShardRequestTable&) = delete;
+    ShardRequestTable& operator=(const ShardRequestTable&) = delete;
+
+    RequestQueue& GetRequestQueueLocked(size_t index)
+    {
+        size_t bucket_num = index % BUCKET_NUM;
+        return request_tables_[bucket_num][index];
+    }
+
+    void EraseRequestQueueLocked(size_t index)
+    {
+        size_t bucket_num = index % BUCKET_NUM;
+        request_tables_[bucket_num].erase(index);
+    }
+
+    std::unique_lock<std::mutex> AcquireShardLock(size_t index)
+    {
+        size_t bucket_num = index % BUCKET_NUM;
+        return std::unique_lock<std::mutex>(*mtxs[bucket_num]);
+    }
+
+private:
+    std::vector<std::unique_ptr<std::mutex>> mtxs;
+    //! worder id --> RequestQueue
+    std::vector<std::unordered_map<size_t, RequestQueue>> request_tables_;
+};
+
 class LockTable {
 public:
     bool RLock(size_t worker_id, size_t index)
     {
-        std::unique_lock<std::mutex> table_latch(latch_);
-        auto& request_queue = request_table_[index];
+        // 获取分段锁
+        auto lock = request_table_.AcquireShardLock(index);
+        auto& request_queue = request_table_.GetRequestQueueLocked(index);
         std::unique_lock<std::mutex> qlock(request_queue.mtx);
-        table_latch.unlock();
+        lock.unlock();
 
-        // 已经存在其他worker对数据加了写锁
+        // 存在其他Worker对数据加了写锁，则加锁失败
         if (!request_queue.TryLock(worker_id, LockType::RLOCK)) {
-            // 将当前worker放入等待队列
+            // 将当前Worker放入等待队列
             request_queue.waiting_items.insert(worker_id);
             bool timeout = !request_queue.cond.wait_for(qlock, std::chrono::milliseconds(300), [&]() {
                 return request_queue.TryLock(worker_id, LockType::RLOCK);
             });
             request_queue.waiting_items.erase(worker_id);
+            // 等待超时，有可能是因为发生死锁，返回false表明加锁失败
             if (timeout) {
                 std::cout << "RLOCK超时\n";
                 return false;
@@ -100,10 +144,10 @@ public:
 
     bool WLock(size_t worker_id, size_t index)
     {
-        std::unique_lock<std::mutex> table_latch(latch_);
-        auto& request_queue = request_table_[index];
+        auto lock = request_table_.AcquireShardLock(index);
+        auto& request_queue = request_table_.GetRequestQueueLocked(index);
         std::unique_lock<std::mutex> qlock(request_queue.mtx);
-        table_latch.unlock();
+        lock.unlock();
 
         std::cout << "WLock: worker_id " << worker_id << " index " << index << "\n";
         if (!request_queue.TryLock(worker_id, LockType::WLOCK)) {
@@ -131,8 +175,8 @@ public:
 
     void RUnlock(size_t worker_id, size_t index)
     {
-        std::unique_lock<std::mutex> table_latch(latch_);
-        auto& request_queue = request_table_[index];
+        auto lock = request_table_.AcquireShardLock(index);
+        auto& request_queue = request_table_.GetRequestQueueLocked(index);
         std::unique_lock<std::mutex> qlock(request_queue.mtx);
 
         std::cout << "RUnlock: ERASE " << worker_id << " index " << index << "\n";
@@ -141,13 +185,13 @@ public:
 
         size_t rlock_items_size = request_queue.rlock_items.size();
         bool has_waiting_item = !request_queue.waiting_items.empty();
-        if (rlock_items_size == 0 && !has_waiting_item && request_queue.wlock_item == 0) {
+        if (rlock_items_size == 0 && !has_waiting_item && request_queue.wlock_item == INVALID_WORKER_ID) {
             // 从哈希表中删除请求队列
-            request_table_.erase(index);
+            request_table_.EraseRequestQueueLocked(index);
             return;
         }
 
-        table_latch.unlock();
+        lock.unlock();
 
         if (has_waiting_item) {
             // 唤醒其中一个请求写锁的Worker
@@ -165,29 +209,29 @@ public:
 
     void WUnlock(size_t worker_id, size_t index)
     {
-        std::unique_lock<std::mutex> table_latch(latch_);
-        auto& request_queue = request_table_[index];
+        auto lock = request_table_.AcquireShardLock(index);
+        auto& request_queue = request_table_.GetRequestQueueLocked(index);
         std::unique_lock<std::mutex> qlock(request_queue.mtx);
 
-        request_queue.wlock_item = 0;
+        assert(request_queue.wlock_item == worker_id);
+        request_queue.wlock_item = INVALID_WORKER_ID;
 
         bool has_waiting_item = !request_queue.waiting_items.empty();
         if (!has_waiting_item) {
+            // 如果是从读锁提升为写锁，那么rlock_items的size为1
             if (request_queue.rlock_items.empty()) {
-                request_table_.erase(index);
+                request_table_.EraseRequestQueueLocked(index);
             }
             return;
         }
 
-        table_latch.unlock();
+        lock.unlock();
 
         request_queue.cond.notify_all();
     }
 
 private:
-    std::mutex latch_;
-    // worder id --> RequestQueue
-    std::unordered_map<size_t, RequestQueue> request_table_;
+    ShardRequestTable request_table_;
 };
 
 struct Worker {
@@ -213,7 +257,8 @@ struct Worker {
         thread = std::thread([&]() {
             std::default_random_engine engin;
             engin.seed(time(nullptr));
-            std::uniform_int_distribution<int> u(0, N);
+            // 0 <= i, j < N
+            std::uniform_int_distribution<int> u(0, N - 1);
             for (size_t idx = 0; idx < 10000; ++idx) {
                 int i = u(engin);
                 int j = u(engin);
@@ -243,7 +288,8 @@ struct Worker {
                 lock_table.WUnlock(worker_id, j);
                 ReleaseRLocks(i, 3);
             }
-            std::cout << "Worker: " << worker_id << "完成\n";
+            std::cout << "Worker: " << worker_id << " Finished"
+                      << " \n";
         });
     }
 
@@ -263,15 +309,6 @@ struct Worker {
 
 int main()
 {
-    size_t M = 0;
-    std::cin >> M;
-
-    if (M < 2) {
-        M = 2;
-    }
-
-    srand((unsigned)time(NULL));
-
     LockTable global_lock_table;
     std::vector<std::unique_ptr<Worker>> workers;
 
